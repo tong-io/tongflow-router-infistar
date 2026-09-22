@@ -5,22 +5,25 @@
 Claude, Gemini, Qwen, DeepSeek, GLM, Kimi, Doubao, MiniMax and Grok, plus image,
 video and transcription models.
 
-> **Not yet exercised against a live key.** Routes and model ids come from
-> Infistar's public docs and model marketplace — see [Unverified](#unverified).
+> **Exercised against a live key on 2026-09-22.** Ten of twelve slots produce
+> real output; see [Verified](#verified) for what the gateway actually accepts
+> and the two slots that need something from Infistar.
 
 ## Capabilities
 
 Implements these ABI slots (runs locally as a Python process, no GPU):
 
-| Slot | Route | Shortlist default |
-| --- | --- | --- |
-| `gen-text` / `split-text` / `combine-text` | `POST /v1/chat/completions` | `gpt-5.6-sol` |
-| `arrange-group` / `drop-video` | `POST /v1/chat/completions` | `gpt-5.6-sol` |
-| `image-gen-text` (image understanding) | `POST /v1/chat/completions` | `gpt-6-astra` |
-| `image-gen` | `POST /v1/images/generations` | `gpt-image-2` |
-| `image-edit` / `image-fusion` | `POST /v1/images/edits` | `qwen-image-edit-max` |
-| `text-gen-video` / `image-gen-video` | `POST /v1/videos` → poll → `/content` | `wan3.0-video` / `wan2.7-i2v` |
-| `transcribe` | `POST /v1/audio/transcriptions` | `qwen-audio-3.0-asr-flash-filetrans` |
+| Slot | Route | Default | Measured |
+| --- | --- | --- | --- |
+| `gen-text` / `split-text` / `combine-text` | `POST /v1/chat/completions` | `gpt-5.6-sol` | 3–17s |
+| `arrange-group` / `drop-video` | local, no LLM call | — | instant |
+| `image-gen-text` (image understanding) | `POST /v1/chat/completions` | `gpt-6-astra` | 16s |
+| `image-gen` | `POST /v1/images/generations` | `gpt-image-2` | 246s |
+| `image-edit` | `POST /v1/images/edits` | `step-image-edit-2` | 16s |
+| `image-fusion` | `POST /v1/images/edits` (`image[]`) | `gpt-image-2` | 643s |
+| `text-gen-video` | `POST /v1/videos` → poll → `/content` | `wan3.0-video` | 203s |
+| `image-gen-video` | `POST /v1/videos` → poll → `/content` | `MiniMax-H3` | 219s |
+| `transcribe` | `POST /v1/audio/transcriptions` | `qwen-audio-3.0-asr-flash-filetrans` | needs an ASR-enabled key |
 
 **Text-to-speech is not implemented.** The gateway answers on `/v1/audio/speech`,
 but its catalog lists no TTS model, so there would be nothing to select.
@@ -55,25 +58,43 @@ Add in TongFlow **Settings** (gear icon, top-right):
 | `INFISTAR_BASE_URL` | optional | Defaults to `https://infistar.cc/v1`; `https://infistar.ai/v1` serves the same account. |
 | `INFISTAR_POLL_TIMEOUT_S` | optional | Max seconds to wait for a video task (default `900`). |
 
-## Unverified
+## Verified
 
-Everything below was derived from Infistar's public docs and public model
-marketplace, **not from a live key**. Each is a plausible failure on first run:
+Run against a live key on 2026-09-22. What the gateway turned out to want,
+none of which is in its docs:
 
-1. **`GET /v1/models` shape.** The live catalog assumes each record carries
-   `supported_endpoint_types`, as the public marketplace does (both are
-   new-api derivatives). If the key's list only returns bare ids, the dropdowns
-   fall back to the shortlist — which still works, just without live extension.
-2. **`/v1/images/edits` request format.** The docs say "most OpenAI-compatible
-   models take `multipart/form-data`; some take image URLs as JSON". This
-   implementation sends multipart, with `image[]` for multi-reference fusion.
-3. **`input_reference.image_url` on `/v1/videos`.** Canvas assets are bytes, so
-   they go in as a data URI. The docs describe a reference image file without
-   saying whether a data URI is accepted.
-4. **Non-streamed chat.** Requests are always streamed, on the assumption that
-   this gateway shares the new-api family's intermittently empty non-streamed
-   body for the GPT-5.x family. Harmless if it doesn't.
-5. **Channel quality.** A third-party probe (veridrop) scored `infistar.ai`
-   71/100 and flagged missing Claude encryption signatures. Worth a straight
-   answer from the vendor about upstream channels before this is presented as
-   an official integration.
+1. **The video route rejects every `seconds` / `size` combination** with
+   「当前模型没有支持本次媒体规格的可用渠道」 — including the values from its
+   own doc examples. The identical request *without* them is accepted, so this
+   plugin sends neither and lets the model pick. `INFISTAR_VIDEO_SECONDS` /
+   `INFISTAR_VIDEO_SIZE` force them back for the day a channel accepts a spec.
+2. **`input_reference` is a plain string**, not OpenAI's `{"image_url": …}`
+   object — the object form is rejected by the gateway's Go decoder. A data URI
+   works; there is no upload endpoint (`/v1/files` exists but wants a model).
+3. **The image-edit route also rejects `size`**, the same way.
+4. **Multi-reference edits need `image[]`** (repeating plain `image` fails with
+   "image file is required") **and a model with a multi-image channel** —
+   `step-image-edit-2` routes single-image edits only, so `image-fusion`
+   defaults to `gpt-image-2`.
+5. **`wan2.7-i2v` fails every image-to-video task**, with a data URI or a public
+   URL alike (`status: failed`, quota refunded), which is why `MiniMax-H3` is
+   the `image-gen-video` default.
+6. **`GET /v1/models` does carry `supported_endpoint_types`** on every record,
+   so the live dropdown extension works as designed.
+7. Failed tasks refund their frozen quota (`billing_status: REFUNDED`).
+
+### Needs something from Infistar
+
+- **`transcribe`**: the test key's group exposes **no** `audio-transcription`
+  model at all, though the public marketplace lists three. The slot is wired
+  and will work on a key whose group includes them.
+- **`drop-video`** returns an empty `clips` list. That is an upstream SDK bug,
+  not this plugin: `drop_video_output()` reads `prompt["fileKeys"]` while the
+  slot's ABI input field is `videos`, and `@node_slot` forbids extras. Every
+  plugin using that helper is affected.
+
+### Slow paths
+
+`gpt-image-2` is the slowest route here by a wide margin — 246s for a single
+generation, 643s for a two-image fusion. `step-image-edit-2` does a single edit
+in 16s. Pick accordingly.

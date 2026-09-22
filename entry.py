@@ -63,10 +63,10 @@ TONGFLOW_SLOT_MODELS = {
     "drop-video": ["gpt-5.6-sol", "claude-sonnet-5", "gemini-3.8-flash", "deepseek-v4-flash", "qwen3.8-max"],
     "image-gen-text": ["gpt-6-astra", "gpt-5.5", "claude-opus-5", "claude-sonnet-5", "gemini-3.1-pro-preview", "qwen3.7-plus"],
     "image-gen": ["gpt-image-2", "qwen-image-2.0-pro", "wan2.7-image-pro", "doubao-seedream-5-0-260128", "gpt-image-2.5-flare", "step-2x-large"],
-    "image-edit": ["qwen-image-edit-max", "gpt-image-2", "step-image-edit-2", "qwen-image-edit-plus"],
-    "image-fusion": ["qwen-image-edit-max", "gpt-image-2", "qwen-image-edit-plus"],
+    "image-edit": ["step-image-edit-2", "gpt-image-2", "qwen-image-edit-max", "qwen-image-edit-plus"],
+    "image-fusion": ["gpt-image-2", "gpt-image-2.5-flare", "qwen-image-edit-max"],
     "text-gen-video": ["wan3.0-video", "wan2.7-t2v", "doubao-seedance-2-5-260628", "MiniMax-H3", "doubao-seedance-2.0-mini"],
-    "image-gen-video": ["wan2.7-i2v", "wan3.0-video", "doubao-seedance-2-5-260628", "MiniMax-H3"],
+    "image-gen-video": ["MiniMax-H3", "doubao-seedance-2-5-260628", "wan3.0-video", "wan2.7-i2v"],
     "transcribe": ["qwen-audio-3.0-asr-flash-filetrans", "stepaudio-2.5-asr"],
 }
 
@@ -119,12 +119,6 @@ TONGFLOW_SLOT_PARAMS = {
     },
     "image-edit": {
         "quality": {"type": "select", "options": ["auto", "low", "medium", "high"], "default": "auto", "label": "Quality", "description": "Only models that document it."},
-    },
-    "text-gen-video": {
-        "seconds": {"type": "select", "options": [4, 5, 8, 10, 12], "default": 5, "label": "Seconds", "description": "The node's duration snaps to this when set; the model decides what it accepts."},
-    },
-    "image-gen-video": {
-        "seconds": {"type": "select", "options": [4, 5, 8, 10, 12], "default": 5, "label": "Seconds", "description": "The node's duration snaps to this when set; the model decides what it accepts."},
     },
 }
 
@@ -505,15 +499,17 @@ def _image_generate(slot: str, prompt: str, width: Optional[int], height: Option
 def _image_edit(slot: str, prompt: str, images: List[Asset], width: Optional[int], height: Optional[int]) -> Asset:
     """`/v1/images/edits` as multipart: several sources go in as `image[]`,
     which is how the OpenAI-compatible route takes multi-reference edits."""
-    fields = {
-        "model": _active_model(slot),
-        "prompt": prompt,
-        "size": _size(width, height, IMAGE_SIZES, DEFAULT_IMAGE_SIZE),
-        "n": "1",
-    }
+    # No `size`: the edits channels reject every value with "当前模型没有支持
+    # 本次媒体规格的可用渠道", the same way the video route does. The edit keeps
+    # the source image's geometry, which is what the node wants anyway.
+    fields = {"model": _active_model(slot), "prompt": prompt, "n": "1"}
     quality = str(_adv("quality", "auto"))
     if quality != "auto":
         fields["quality"] = quality
+    # OpenAI's spelling: one `image` for a single source, `image[]` per source
+    # for a multi-reference edit. Which models have a multi-image channel is a
+    # separate matter — step-image-edit-2 only routes single-image edits, so
+    # image-fusion defaults to gpt-image-2.
     files = [
         (
             "image[]" if len(images) > 1 else "image",
@@ -533,23 +529,25 @@ def _image_edit(slot: str, prompt: str, images: List[Asset], width: Optional[int
 # ── Videos (OpenAI Videos shape: submit → poll → download) ─────────────────
 
 
-def _video(slot: str, prompt: str, *, image: Optional[Asset], duration: Optional[float],
-           width: Optional[int], height: Optional[int]) -> Asset:
-    seconds = int(_adv("seconds", DEFAULT_VIDEO_SECONDS))
-    if duration:
-        seconds = int(duration)
-    body: Dict[str, Any] = {
-        "model": _active_model(slot),
-        "prompt": prompt,
-        "seconds": seconds,
-        "size": _size(width, height, VIDEO_SIZES, DEFAULT_VIDEO_SIZE),
-    }
+def _video(slot: str, prompt: str, *, image: Optional[Asset]) -> Asset:
+    body: Dict[str, Any] = {"model": _active_model(slot), "prompt": prompt}
+    # `seconds` / `size` are deliberately omitted: every combination is
+    # rejected with "当前模型没有支持本次媒体规格的可用渠道", while the same
+    # request without them is accepted, so the gateway's video channels take
+    # the model's own defaults. The env vars are an escape hatch for the day a
+    # channel does accept a spec. The node's own duration / width / height are
+    # not read at all: `@node_slot` deep-`model_construct`s without filling
+    # defaults, so an untouched optional field has no attribute to read.
+    spec_seconds = _env("INFISTAR_VIDEO_SECONDS")
+    if spec_seconds:
+        body["seconds"] = int(spec_seconds)
+    spec_size = _env("INFISTAR_VIDEO_SIZE")
+    if spec_size:
+        body["size"] = spec_size
     if image is not None:
-        # Docs call this a reference image for image-to-video; the route takes
-        # it as a URL, so canvas bytes go in as a data URI.
-        body["input_reference"] = {
-            "image_url": _data_url(image, default_mime="image/png")
-        }
+        # `input_reference` is a plain string (a URL or data URI) — passing the
+        # OpenAI-style {"image_url": ...} object is rejected by the Go decoder.
+        body["input_reference"] = _data_url(image, default_mime="image/png")
 
     created = _json_request("POST", f"{_base_url()}/videos", body, timeout=300)
     task_id = created.get("id") or created.get("task_id")
@@ -574,7 +572,8 @@ def _video(slot: str, prompt: str, *, image: Optional[Asset], duration: Optional
             raise
         status = str(state.get("status") or "").lower()
         if status == "completed":
-            url = state.get("url")
+            meta = state.get("metadata")
+            url = state.get("url") or (meta.get("url") if isinstance(meta, dict) else None)
             if isinstance(url, str) and url.startswith("http"):
                 content, ctype = _download(url)
                 return asset(content, mime=ctype or "video/mp4")
@@ -658,8 +657,11 @@ def split_text(input: SplitTextInput) -> SplitTextOutput:
 
 @node_slot(NodeSlots.IMAGE_GEN_TEXT)
 def image_gen_text(input: ImageGenTextInput) -> ImageGenTextOutput:
-    prompt = (input.userPrompt or "").strip() or (input.text or "").strip() or "Describe this image."
-    answer = _chat("image-gen-text", _vision_message(prompt, [input.image]))
+    prompt = (input.text or "").strip() or "Describe this image."
+    messages = _vision_message(prompt, [input.image])
+    if input.system:
+        messages.insert(0, {"role": "system", "content": input.system})
+    answer = _chat("image-gen-text", messages)
     return ImageGenTextOutput(success=True, text=answer)
 
 
@@ -686,27 +688,13 @@ def image_fusion(input: ImageFusionInput) -> ImageFusionOutput:
 
 @node_slot(NodeSlots.TEXT_GEN_VIDEO)
 def text_gen_video(input: TextGenVideoInput) -> TextGenVideoOutput:
-    video = _video(
-        "text-gen-video",
-        input.text,
-        image=None,
-        duration=input.duration,
-        width=input.width,
-        height=input.height,
-    )
+    video = _video("text-gen-video", input.text, image=None)
     return TextGenVideoOutput(success=True, video=video)
 
 
 @node_slot(NodeSlots.IMAGE_GEN_VIDEO)
 def image_gen_video(input: ImageGenVideoInput) -> ImageGenVideoOutput:
-    video = _video(
-        "image-gen-video",
-        input.text,
-        image=input.image,
-        duration=input.duration,
-        width=input.width,
-        height=input.height,
-    )
+    video = _video("image-gen-video", input.text, image=input.image)
     return ImageGenVideoOutput(success=True, video=video)
 
 
