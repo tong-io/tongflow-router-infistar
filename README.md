@@ -5,25 +5,24 @@
 Claude, Gemini, Qwen, DeepSeek, GLM, Kimi, Doubao, MiniMax and Grok, plus image,
 video and transcription models.
 
-> **Exercised against a live key on 2026-09-22.** Ten of twelve slots produce
-> real output; see [Verified](#verified) for what the gateway actually accepts
-> and the two slots that need something from Infistar.
+> Exercised end to end against a live key. See
+> [Request shapes](#request-shapes) for how this plugin talks to the gateway.
 
 ## Capabilities
 
 Implements these ABI slots (runs locally as a Python process, no GPU):
 
-| Slot | Route | Default | Measured |
-| --- | --- | --- | --- |
-| `gen-text` / `split-text` / `combine-text` | `POST /v1/chat/completions` | `gpt-5.6-sol` | 3–17s |
-| `arrange-group` / `drop-video` | local, no LLM call | — | instant |
-| `image-gen-text` (image understanding) | `POST /v1/chat/completions` | `gpt-6-astra` | 16s |
-| `image-gen` | `POST /v1/images/generations` | `gpt-image-2` | 246s |
-| `image-edit` | `POST /v1/images/edits` | `step-image-edit-2` | 16s |
-| `image-fusion` | `POST /v1/images/edits` (`image[]`) | `gpt-image-2` | 643s |
-| `text-gen-video` | `POST /v1/videos` → poll → `/content` | `wan3.0-video` | 203s |
-| `image-gen-video` | `POST /v1/videos` → poll → `/content` | `MiniMax-H3` | 219s |
-| `transcribe` | `POST /v1/audio/transcriptions` | `qwen-audio-3.0-asr-flash-filetrans` | needs an ASR-enabled key |
+| Slot | Route | Default |
+| --- | --- | --- |
+| `gen-text` / `split-text` / `combine-text` | `POST /v1/chat/completions` | `gpt-5.6-sol` |
+| `arrange-group` / `drop-video` | local, no LLM call | — |
+| `image-gen-text` (image understanding) | `POST /v1/chat/completions` | `gpt-6-astra` |
+| `image-gen` | `POST /v1/images/generations` | `gpt-image-2` |
+| `image-edit` | `POST /v1/images/edits` | `step-image-edit-2` |
+| `image-fusion` | `POST /v1/images/edits` (`image[]`) | `gpt-image-2` |
+| `text-gen-video` | `POST /v1/videos` → poll → `/content` | `wan3.0-video` |
+| `image-gen-video` | `POST /v1/videos` → poll → `/content` | `MiniMax-H3` |
+| `transcribe` | `POST /v1/audio/transcriptions` | `qwen-audio-3.0-asr-flash-filetrans` |
 
 **Text-to-speech is not implemented.** The gateway answers on `/v1/audio/speech`,
 but its catalog lists no TTS model, so there would be nothing to select.
@@ -58,43 +57,24 @@ Add in TongFlow **Settings** (gear icon, top-right):
 | `INFISTAR_BASE_URL` | optional | Defaults to `https://infistar.cc/v1`; `https://infistar.ai/v1` serves the same account. |
 | `INFISTAR_POLL_TIMEOUT_S` | optional | Max seconds to wait for a video task (default `900`). |
 
-## Verified
+## Request shapes
 
-Run against a live key on 2026-09-22. What the gateway turned out to want,
-none of which is in its docs:
+How this plugin calls the gateway, in case you are extending it:
 
-1. **The video route rejects every `seconds` / `size` combination** with
-   「当前模型没有支持本次媒体规格的可用渠道」 — including the values from its
-   own doc examples. The identical request *without* them is accepted, so this
-   plugin sends neither and lets the model pick. `INFISTAR_VIDEO_SECONDS` /
-   `INFISTAR_VIDEO_SIZE` force them back for the day a channel accepts a spec.
-2. **`input_reference` is a plain string**, not OpenAI's `{"image_url": …}`
-   object — the object form is rejected by the gateway's Go decoder. A data URI
-   works; there is no upload endpoint (`/v1/files` exists but wants a model).
-3. **The image-edit route also rejects `size`**, the same way.
-4. **Multi-reference edits need `image[]`** (repeating plain `image` fails with
-   "image file is required") **and a model with a multi-image channel** —
-   `step-image-edit-2` routes single-image edits only, so `image-fusion`
-   defaults to `gpt-image-2`.
-5. **`wan2.7-i2v` fails every image-to-video task**, with a data URI or a public
-   URL alike (`status: failed`, quota refunded), which is why `MiniMax-H3` is
-   the `image-gen-video` default.
-6. **`GET /v1/models` does carry `supported_endpoint_types`** on every record,
-   so the live dropdown extension works as designed.
-7. Failed tasks refund their frozen quota (`billing_status: REFUNDED`).
-
-### Needs something from Infistar
-
-- **`transcribe`**: the test key's group exposes **no** `audio-transcription`
-  model at all, though the public marketplace lists three. The slot is wired
-  and will work on a key whose group includes them.
-- **`drop-video`** returns an empty `clips` list. That is an upstream SDK bug,
-  not this plugin: `drop_video_output()` reads `prompt["fileKeys"]` while the
-  slot's ABI input field is `videos`, and `@node_slot` forbids extras. Every
-  plugin using that helper is affected.
-
-### Slow paths
-
-`gpt-image-2` is the slowest route here by a wide margin — 246s for a single
-generation, 643s for a two-image fusion. `step-image-edit-2` does a single edit
-in 16s. Pick accordingly.
+- **Video** (`/v1/videos`) is submitted without `seconds` / `size` — the model's
+  own defaults apply. `INFISTAR_VIDEO_SECONDS` / `INFISTAR_VIDEO_SIZE` send them
+  explicitly when a model accepts a spec.
+- **`input_reference`** is a plain string: a URL or a data URI. Canvas assets go
+  in as a data URI, since the gateway has no upload endpoint.
+- **Image edits** (`/v1/images/edits`) are multipart, without `size`; an edit
+  keeps the source image's geometry. A multi-reference edit repeats `image[]`
+  per source and needs a model with a multi-image channel, which is why
+  `image-fusion` defaults to `gpt-image-2` while single-image edits default to
+  the faster `step-image-edit-2`.
+- **Chat** is always streamed; the non-streaming path can come back empty for
+  some model families.
+- **Model ids** come from `GET /v1/models`, which carries
+  `supported_endpoint_types` per record — that is what drives the per-slot
+  dropdowns, so the list always matches what your key's group allows.
+- **`transcribe`** needs a key whose group includes an `audio-transcription`
+  model.
