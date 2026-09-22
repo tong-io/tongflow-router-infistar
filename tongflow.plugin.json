@@ -1,0 +1,25 @@
+{
+    "plugin": {
+        "name": "Infistar",
+        "description": "Infistar (无限星河AI) gateway — one key for GPT, Claude, Gemini, Qwen, DeepSeek, GLM, Kimi, Doubao, MiniMax, plus image, video and transcription models.",
+        "icon": "/plugins/tongflow-router-infistar.svg"
+    },
+    "env": [
+        {
+            "key": "INFISTAR_API_KEY",
+            "required": true,
+            "description": "Infistar API token (创建于控制台「令牌管理」)",
+            "url": "https://infistar.cc"
+        },
+        {
+            "key": "INFISTAR_BASE_URL",
+            "default": "https://infistar.cc/v1",
+            "description": "Override the endpoint (infistar.ai/v1 serves the same account)"
+        },
+        {
+            "key": "INFISTAR_POLL_TIMEOUT_S",
+            "default": "900",
+            "description": "Max seconds to wait for a video task"
+        }
+    ]
+}
